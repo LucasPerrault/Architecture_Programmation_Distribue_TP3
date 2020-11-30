@@ -213,9 +213,9 @@ public class FTBillboardServer extends UnicastRemoteObject implements FTBillboar
         replicas.put(server,replica);
         System.out.println("Registered " + server);
         // If it is leader, registers back to the replica
-        /**if(isLeader) {
+        if(isLeader) {
             replica.registerReplica(serverName,this);
-        }*/
+        }
 
     }
 
