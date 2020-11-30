@@ -1,85 +1,225 @@
-import interfaces.FTBillboard;
-import java.net.MalformedURLException;
-import java.rmi.AlreadyBoundException;
-import java.rmi.Naming;
 import java.rmi.NotBoundException;
 import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
+import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
-import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.*;
 
-public class FTBillboardServer extends BillboardServer implements FTBillboard {
-    private final static String RMI = "rmi://";
-    private final static String HOST = "localhost";
-    private final static String SERVER_NAME = "/server_fault_tolerancy";
 
-    private java.rmi.registry.Registry currentLeader;
+/**
+ * This class delegates to a BillboardServer instance and replicates values top the other guys
+ * Fault detection is done by pinging each others, and leader election is carried out by sorting the server names thx
+ * to a local sorted map.
+ */
+public class FTBillboardServer extends UnicastRemoteObject implements FTBillboard {
 
-    protected FTBillboardServer(String host) throws RemoteException {
-        super();
-        currentLeader =  java.rmi.registry.LocateRegistry.getRegistry(host);
-    }
+    public static int THREAD_POOL_SIZE = 2;
+    public static int PING_FREQ = 1000;
+
+
+
+    private boolean stop =false;
+
+
+
+
+    private final Object coordinatorLock = new Object();
+    private String coordinator, serverName;
+
+    private boolean isLeader = false;
+    private final ConcurrentSkipListMap<String, FTBillboard> replicas = new ConcurrentSkipListMap<>();
+    private final ExecutorService pool = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
+
+
+    private final Billboard delegate = new BillboardServer();
+
+
 
     /**
-     * Returns the name of the current leader for this instance
-     * @return String containing address:port of the leader's registry
-     * @throws RemoteException
+     * Registration of neighbours from the leader
+     * Ensures fault detection and change of leadership
      */
-    public String getLeader() throws RemoteException {
-        return currentLeader.list()[0];
+    private final Thread pingThread = new Thread(() -> {
+
+        while(!stop) {
+            try {
+                Thread.sleep(PING_FREQ);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+            String cName = null;
+            synchronized (coordinatorLock) {
+                cName = new String(coordinator);
+            }
+
+            FTBillboard master = replicas.get(cName);
+            if(master!=null && !isLeader) {
+                List<String> repList = null;
+                try {
+                    System.out.println(serverName);
+                    master.registerReplica(serverName,this);
+                    repList = master.getNeighbors();
+                } catch (RemoteException e) {
+                    System.out.println("Leader Ping failed = " + e.getMessage());
+                    changeLeader(cName);
+                }
+                updateReplicas(repList);
+            }
+
+
+        }
+    });
+
+    private  void connectToReplica(String address) {
+        String [] parseAddr = address.split(":");
+        String host = parseAddr[0];
+        int port = Integer.parseInt(parseAddr[1]);
+        try {
+            Registry remoteTmp = LocateRegistry.getRegistry(host,port);
+            FTBillboard nvReplica = (FTBillboard) remoteTmp.lookup(FTBillboard.LOOKUP_NAME);
+            replicas.put(address, nvReplica);
+            nvReplica.registerReplica(serverName,this);
+        } catch (RemoteException e) {
+            e.printStackTrace();
+        } catch (NotBoundException e) {
+            e.printStackTrace();
+        }
+
     }
+    private void updateReplicas(List<String> repList) {
+        if(repList !=null) {
+            for (String nb : repList) {
+                if(!replicas.containsKey(nb)) {
+                    connectToReplica(nb);
+                }
+
+            }
+        }
+    }
+
+
+    private void changeLeader(String master) {
+        replicas.remove(master);
+        String newLeader = replicas.firstKey();
+        synchronized (coordinatorLock) {
+            coordinator = newLeader;
+            if(coordinator.equals(serverName))
+                isLeader = true;
+        }
+
+        System.out.println("New leader is " + newLeader);
+    }
+
+
+    public FTBillboardServer(String serverName, String coordinator, FTBillboard masterServer) throws RemoteException {
+        super();
+        this.coordinator = coordinator;
+        this.serverName = serverName;
+        if(coordinator.equals(serverName)) {
+            isLeader = true;
+        }
+
+        replicas.put(serverName,this);
+        if(masterServer!=null) {
+            replicas.put(coordinator,masterServer);
+        }
+    }
+
     /**
-     * List of address:port of neighbors of this node.
-     * If this node is leader, it will return the list of replicas.
+     * Return this node's leader name
      * @return
      * @throws RemoteException
      */
-    public List<String> getNeighbors() throws RemoteException {
-        return Arrays.asList(currentLeader.list());
+    @Override
+    public String getLeader() throws RemoteException {
+        String def = null;
+        synchronized (coordinatorLock) {
+            def = new String(coordinator);
+        }
+        return def;
     }
+
+    @Override
+    public String getMessage() throws RemoteException {
+        return delegate.getMessage();
+    }
+
+    private void replicateMessage(String message) {
+        List<Future> ftList = new ArrayList<>();
+        for(Map.Entry<String, FTBillboard> replica : replicas.entrySet()) {
+
+            if(!serverName.equals(replica.getKey())) {
+                Future f = pool.submit(() -> {
+                    try {
+                        replica.getValue().setMessage(message);
+                    } catch (RemoteException e) {
+                        System.err.println("Problem replicating with " + replica.getKey());
+                        System.err.println("Removing from replica set");
+                        replicas.remove(replica.getKey());
+                    }
+                });
+
+                ftList.add(f);
+            }
+        }
+
+        // Wait for each task to end.
+        for(Future f: ftList)
+            try {
+                f.get(30, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            } catch (ExecutionException e) {
+                e.printStackTrace();
+            } catch (TimeoutException e) {
+                e.printStackTrace();
+            }
+    }
+
     /**
-     * Registers a replica to a leader.
-     * If the leader does not answer this request in a timely fashion,
-     * a new leader is chosen as the first element of the replica list after
-     * removal of the leader.
-     * @param server address:port of the caller
-     * @param replica callback
+     * Sets the local message atomically and replicates the message in parallel if it is the leader.
+     * @param message
      * @throws RemoteException
      */
-    public void registerReplica(String server, FTBillboard replica) throws RemoteException, MalformedURLException, NotBoundException, AlreadyBoundException {
-        Naming.bind(server, replica);
+    @Override
+    public void setMessage(String message) throws RemoteException {
+        delegate.setMessage(message);
+        // Replicates only if leader
+        if(isLeader) {
+            replicateMessage(message);
+
+        }
     }
 
-    public static void main(String args[])
-    {
-        try
-        {
-            /* Basic server */
+    /**
+     * Lists the names of known replicas if it is leader.
+     * @return
+     * @throws RemoteException
+     */
 
-            /* 1 - Configuration */
-            final int port = 1099;
-            String serverUrl = RMI + HOST + ":" + port + SERVER_NAME;
-
-            /* 2 - Init */
-            FTBillboardServer server = new FTBillboardServer(HOST);
-            java.rmi.registry.LocateRegistry.createRegistry(port);
-            Naming.rebind(serverUrl, server);
+    @Override
+    public List<String> getNeighbors() throws RemoteException {
+        List<String> replicaCopy = new ArrayList<>();
+        replicaCopy.addAll(replicas.keySet());
+        return replicaCopy;
+    }
 
 
-            /* Replica server */
-            final int replicaPort = 1250;
-            String replicaServerUrl = RMI + HOST + ":" + replicaPort + SERVER_NAME;
+    @Override
+    public void registerReplica(String server, FTBillboard replica) throws RemoteException {
+        replicas.put(server,replica);
+        System.out.println("Registered " + server);
+        // If it is leader, registers back to the replica
+        /**if(isLeader) {
+            replica.registerReplica(serverName,this);
+        }*/
 
-            FTBillboard replicaServer = new FTBillboardServer(HOST);
-            java.rmi.registry.LocateRegistry.createRegistry(replicaPort);
-            server.registerReplica(replicaServerUrl, replicaServer);
+    }
 
-            UnicastRemoteObject.exportObject(replicaServer);
-        }
-        catch(Exception e)
-        {
-            e.printStackTrace();
-        }
+    public void startPing() {
+        this.pingThread.start();
     }
 }
